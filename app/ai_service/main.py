@@ -1,28 +1,41 @@
+import os
 import json
 import re
 import traceback
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, Request, Depends
+from dotenv import load_dotenv
+load_dotenv()  # تفعيل تحميل متغيرات البيئة من ملف .env فوراً
+
+from fastapi import FastAPI, Request, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from groq import Groq
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 # استيراد إعدادات والنماذج الخاصة بقاعدة البيانات
 from .database import engine, Base, get_db
-from .models import DBPerformanceInsight, DBFeedbackCapture
+from .models import DBPerformanceInsight, DBFeedbackCapture, DBUser
+from .auth import verify_password, get_password_hash, create_access_token, get_current_user
+
+# استيراد دوال نظام التقييمات (Feedback System) - تم تعديل المسار ليتوافق مع المجلد الرئيسي
+from .feedback_capture import capture_feedback, analyze_feedback
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    role: str = "manager"
+
 
 # إنشاء الجداول تلقائياً في SQLite عند بدء التشغيل
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Smart HR - AI Analytics System")
 
-import os
-
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "your_groq_api_key_here")
 client = Groq(api_key=GROQ_API_KEY)
+
 # Global History Database (In-Memory Fallback)
 history_db = {}
 
@@ -36,9 +49,11 @@ class FeedbackCaptureRequest(BaseModel):
     tasks_completed: int = Field(..., example=40)
     feedback: str = Field(..., example="Good team player, delivers code on time.")
 
+
 class PolicyRequest(BaseModel):
     employee_id: str = Field(..., example="EMP-101")
     question: str = Field(..., example="ما هي سياسة الإجازات السنوية وكيف يمكنني طلب إجازة؟")
+
 
 class EvaluationDraftRequest(BaseModel):
     employee_id: str = Field(..., example="EMP-101")
@@ -47,8 +62,18 @@ class EvaluationDraftRequest(BaseModel):
     manager_notes: Optional[str] = Field(None, example="أظهر التزاماً كبيراً وتطوراً في العمل الجماعي.")
 
 
+class FeedbackRequest(BaseModel):
+    insight_id: str = Field(..., example="INSIGHT-EMP-101-1")
+    insight_type: str = Field(..., example="performance_insight")
+    user_id: str = Field(..., example="user_123")
+    user_role: str = Field(..., example="manager")
+    rating: str = Field(..., example="useful")  # useful أو not_useful
+    flagged_for_review: bool = Field(False, example=False)
+    comment: Optional[str] = Field(None, example="أداء ممتاز وتحليل دقيق")
+
+
 # ---------------------------------------------------------
-# 1. Safe Fallback Behavior (Global Handler)
+# 1. Exception Handling
 # ---------------------------------------------------------
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -67,6 +92,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 # ---------------------------------------------------------
 @app.post("/ai/feedback-capture")
 @app.post("/performance-insight")
+@app.post("/ai/performance-insight")  # <--- تمت إضافة هذا المسار ليتطابق مع طلب الواجهة
 def capture_feedback_and_generate_insight(
     payload: FeedbackCaptureRequest, 
     db: Session = Depends(get_db)
@@ -108,9 +134,8 @@ def capture_feedback_and_generate_insight(
         db_insight = DBPerformanceInsight(
             insight_id=insight_id,
             employee_id=payload.employee_id,
-            performance_score=payload.performance_score,
-            tasks_completed=payload.tasks_completed,
-            feedback=payload.feedback
+            overall_score=payload.performance_score,
+            summary=insight_text
         )
         db.add(db_insight)
         db.commit()
@@ -141,9 +166,8 @@ def capture_feedback_and_generate_insight(
             db_insight = DBPerformanceInsight(
                 insight_id=insight_id,
                 employee_id=payload.employee_id,
-                performance_score=payload.performance_score,
-                tasks_completed=payload.tasks_completed,
-                feedback=payload.feedback
+                overall_score=payload.performance_score,
+                summary=fallback_entry["insight"]
             )
             db.add(db_insight)
             db.commit()
@@ -201,7 +225,6 @@ def hr_policy_assistant(payload: PolicyRequest):
 # ---------------------------------------------------------
 @app.get("/ai/history")
 def get_insight_history(db: Session = Depends(get_db)):
-    # استرجاع البيانات المباشرة من قاعدة البيانات أولاً
     db_records = db.query(DBPerformanceInsight).all()
     
     if db_records:
@@ -209,9 +232,8 @@ def get_insight_history(db: Session = Depends(get_db)):
             {
                 "insight_id": record.insight_id,
                 "employee_id": record.employee_id,
-                "performance_score": record.performance_score,
-                "tasks_completed": record.tasks_completed,
-                "feedback": record.feedback,
+                "overall_score": record.overall_score,
+                "summary": record.summary,
                 "created_at": str(record.created_at)
             }
             for record in db_records
@@ -223,7 +245,6 @@ def get_insight_history(db: Session = Depends(get_db)):
             "history": formatted_history
         }
 
-    # القراءة من الـ Memory في حالة الفلباك
     return {
         "status": "success",
         "source": "in_memory",
@@ -234,7 +255,6 @@ def get_insight_history(db: Session = Depends(get_db)):
 
 @app.post("/ai/regenerate/{insight_id}")
 def regenerate_insight(insight_id: str, db: Session = Depends(get_db)):
-    # البحث في قاعدة البيانات أولاً لتلافي مشكلة الـ 404
     db_insight = db.query(DBPerformanceInsight).filter(DBPerformanceInsight.insight_id == insight_id).first()
     
     if not db_insight and insight_id not in history_db:
@@ -243,18 +263,15 @@ def regenerate_insight(insight_id: str, db: Session = Depends(get_db)):
             content={"status": "error", "message": f"Insight ID '{insight_id}' not found in history or database."}
         )
     
-    # تحضير البيانات المطلوبة لإعادة التوليد
     employee_id = db_insight.employee_id if db_insight else history_db[insight_id].get("employee_id")
-    score = db_insight.performance_score if db_insight else history_db[insight_id].get("score")
-    tasks = db_insight.tasks_completed if db_insight else history_db[insight_id].get("tasks_completed")
-    feedback = db_insight.feedback if db_insight else history_db[insight_id].get("feedback")
+    score = db_insight.overall_score if db_insight else history_db[insight_id].get("score")
+    summary_text = db_insight.summary if db_insight else history_db[insight_id].get("insight")
     
     try:
         prompt = f"""
         قم بإعادة تحليل وتقييم أداء الموظف {employee_id} بصياغة جديدة ورؤية أكثر عمقاً:
         درجة الأداء: {score}
-        المهام المكتملة: {tasks}
-        الملاحظات والـ Feedback: {feedback}
+        الملخص السابق: {summary_text}
         """
         
         response = client.chat.completions.create(
@@ -264,6 +281,10 @@ def regenerate_insight(insight_id: str, db: Session = Depends(get_db)):
         
         new_insight = response.choices[0].message.content
         
+        if db_insight:
+            db_insight.summary = new_insight
+            db.commit()
+
         if insight_id in history_db:
             history_db[insight_id]["insight"] = new_insight
             history_db[insight_id]["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -291,9 +312,8 @@ def generate_evaluation_draft(payload: EvaluationDraftRequest, db: Session = Dep
     draft_id = f"DRAFT-{payload.employee_id}-{len(history_db) + 1}"
     
     try:
-        # البحث عن التحليلات السابقة من DB و In-Memory
         past_db_insights = db.query(DBPerformanceInsight).filter(DBPerformanceInsight.employee_id == payload.employee_id).all()
-        past_insights_texts = [f"Score: {item.performance_score}, Feedback: {item.feedback}" for item in past_db_insights]
+        past_insights_texts = [f"Score: {item.overall_score}, Summary: {item.summary}" for item in past_db_insights]
         
         if not past_insights_texts:
             past_insights_texts = [item["insight"] for item in history_db.values() if item.get("employee_id") == payload.employee_id]
@@ -346,6 +366,72 @@ def generate_evaluation_draft(payload: EvaluationDraftRequest, db: Session = Dep
             "employee_id": payload.employee_id,
             "evaluation_draft": "تم إعداد مسودة مبسطة: الموظف مستمر في تحقيق متطلبات التقييم الدورية. (Safe Fallback)"
         }
+
+
+# ---------------------------------------------------------
+# 6. AI Feedback Management Endpoints (New)
+# ---------------------------------------------------------
+@app.post("/ai/feedback")
+def submit_ai_feedback(payload: FeedbackRequest):
+    try:
+        record = capture_feedback(
+            insight_id=payload.insight_id,
+            insight_type=payload.insight_type,
+            user_id=payload.user_id,
+            user_role=payload.user_role,
+            rating=payload.rating,
+            flagged_for_review=payload.flagged_for_review,
+            comment=payload.comment
+        )
+        return {
+            "status": "success",
+            "message": "Feedback captured successfully",
+            "data": record
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ai/feedback/analysis")
+def get_ai_feedback_analysis():
+    report = analyze_feedback()
+    return {
+        "status": "success",
+        "analysis_report": report
+    }
+
+
+# ---------------------------------------------------------
+# 7. Authentication Endpoints
+# ---------------------------------------------------------
+@app.post("/register")
+def register_user(user: UserCreate, db: Session = Depends(get_db)):
+    db_user = db.query(DBUser).filter(DBUser.username == user.username).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Username already registered")
+    
+    clean_password = user.password.encode('utf-8')[:72].decode('utf-8', errors='ignore')
+    hashed_pwd = get_password_hash(clean_password)
+    
+    new_user = DBUser(username=user.username, hashed_password=hashed_pwd, role=user.role)
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return {"message": "User registered successfully", "username": new_user.username}
+
+
+@app.post("/token")
+def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(DBUser).filter(DBUser.username == form_data.username).first()
+    
+    clean_password = form_data.password.encode('utf-8')[:72].decode('utf-8', errors='ignore')
+    if not user or not verify_password(clean_password, user.hashed_password):
+        raise HTTPException(status_code=400, detail="Incorrect username or password")
+    
+    access_token = create_access_token(data={"sub": user.username, "role": user.role})
+    return {"access_token": access_token, "token_type": "bearer"}
 
 
 if __name__ == "__main__":

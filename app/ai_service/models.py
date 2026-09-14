@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime
+from sqlalchemy import Column, Integer, String, Text, Float, DateTime
 from datetime import datetime
 from .database import Base
 
@@ -8,9 +8,8 @@ class DBPerformanceInsight(Base):
     id = Column(Integer, primary_key=True, index=True)
     insight_id = Column(String, unique=True, index=True)
     employee_id = Column(String, index=True)
-    performance_score = Column(Float)
-    tasks_completed = Column(Integer)
-    feedback = Column(String)
+    overall_score = Column(Float)
+    summary = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class DBFeedbackCapture(Base):
@@ -23,3 +22,11 @@ class DBFeedbackCapture(Base):
     rating = Column(String)
     comment = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class DBUser(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    role = Column(String, default="manager")
