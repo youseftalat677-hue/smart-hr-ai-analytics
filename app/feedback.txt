@@ -1,0 +1,4 @@
+useful | الرد مفيد وواضح
+useful | النتيجة مفيدة وواضحة
+AI Output: 101 | User: 5 | Feedback: useful | Comment: النتيجه مفيده | Time: 2026-09-07 11:48:26
+AI Output: 3 | User: محتاج مراجعة الإجابة | Feedback: flag_review | Comment: محتاج مراجعة الإجابة | Time: 2026-09-07 11:51:45

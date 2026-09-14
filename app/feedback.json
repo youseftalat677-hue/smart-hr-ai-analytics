@@ -1,0 +1,32 @@
+[
+  {
+    "insight_id": "test-1",
+    "insight_type": "policy_answer",
+    "user_id": "emp-1",
+    "user_role": "hr",
+    "rating": "not_useful",
+    "flagged_for_review": false,
+    "comment": null,
+    "submitted_at": "2026-09-07T11:40:48.804079+00:00"
+  },
+  {
+    "insight_id": "test-2",
+    "insight_type": "policy_answer",
+    "user_id": "emp-2",
+    "user_role": "employee",
+    "rating": "useful",
+    "flagged_for_review": false,
+    "comment": null,
+    "submitted_at": "2026-09-07T11:44:00.277374+00:00"
+  },
+  {
+    "insight_id": "test-3",
+    "insight_type": "policy_answer",
+    "user_id": "emp-3",
+    "user_role": "employee",
+    "rating": "useful",
+    "flagged_for_review": false,
+    "comment": null,
+    "submitted_at": "2026-09-09T07:52:15.318039+00:00"
+  }
+]
